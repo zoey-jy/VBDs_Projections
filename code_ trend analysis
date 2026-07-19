@@ -1,0 +1,213 @@
+# ============================================================================
+# Trend Analysis for HFRS: Historical and Future Projections
+# This script processes INLA model outputs, computes city-level trends (Sen's slope),
+# ============================================================================
+
+library(dplyr)
+library(trend)
+library(ggplot2)
+library(tidyr)   # for replace_na
+
+data_dir   <- "path/to/your/data"
+
+# ----------------------------- Helper Functions -----------------------------
+
+# Categorize trend direction based on slope and p-value
+sens.recode <- function(slope, p.value, p.sig = 0.05) {
+  if (slope > 0 & p.value < p.sig) return(1)
+  if (slope < 0 & p.value < p.sig) return(-1)
+  return(0)
+}
+
+# Percent difference with zero handling
+percent.diff <- function(obs, pred) {
+  if (obs == 0) return((pred - 0.001) / 0.001 * 100)
+  return((pred - obs) / obs * 100)
+}
+
+# ----------------------------- Data Loading & Preparation -------------------
+
+# Historical data (2005–2024)
+hist_data <- read.csv(file.path(data_dir,"HFRS/05-24_city_year_month_order.csv"))
+
+colnames(hist_data)[11] <- "省名"
+
+# Aggregate to yearly city-level incidence
+data_yearly <- hist_data %>%
+  group_by(市代码, 市名, 省名, 年) %>%
+  summarise(
+    total_cases = sum(病例数, na.rm = TRUE),
+    avg_pop     = mean(人口, na.rm = TRUE),
+    incidence   = total_cases / avg_pop * 1e5,
+    .groups = "drop"
+  )
+
+# Historical average incidence per city (for risk classification)
+city_avg <- data_yearly %>%
+  group_by(市代码, 市名, 省名) %>%
+  summarise(
+    mean_cases = mean(total_cases, na.rm = TRUE),
+    mean_pop   = mean(avg_pop, na.rm = TRUE),
+    mean_inc   = mean_cases / mean_pop * 1e5,
+    .groups = "drop"
+  )
+
+# Compute risk thresholds from positive incidences
+nonzero_inc <- city_avg$mean_inc[city_avg$mean_inc > 0]
+if (length(nonzero_inc) > 0) {
+  thresholds <- quantile(nonzero_inc, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+} else {
+  thresholds <- c(0, 0, 0)
+}
+
+# ----------------------------- Future Prediction Aggregation -----------------
+
+scenario.list <- c("SSP585")   # modify as needed, but original code used only SSP585 for loop? Actually later used all four, but original loop only SSP585? We'll keep all as defined.
+pattern.list <- c("IPSL-CM6A-LR", "NorESM2-MM", "MPI-ESM1-2-HR", "MRI-ESM2-0", "CMCC-ESM2")
+popS.list <- c("SSP1", "SSP2", "SSP3")
+flowS.list <- c("SSP1", "SSP2", "SSP3")
+
+# Directory containing future INLA results
+rdata.dir <- "path/to/your/output"
+
+# Initialize data frame to store city-year predictions from all scenarios
+pred_all <- data.frame()
+
+for (s in scenario.list) {
+  for (p in pattern.list) {
+    for (pop in popS.list) {
+      for (flow in flowS.list) {
+        file.name <- sprintf("obj.inla_%s_%s_flux%s_pop%s.RData", s, p, flow, pop)
+        file.path <- file.path(rdata.dir, file.name)
+        if (!file.exists(file.path)) next
+        
+        load(file.path)
+        df <- fit$data
+        
+        # Aggregate to city-year level
+        df_agg <- df %>%
+          group_by(cid, city, year) %>%
+          summarise(Pred_sum = sum(Pred, na.rm = TRUE), .groups = "drop") %>%
+          mutate(Scenario = s, Pattern = p, PopS = pop, FlowS = flow)
+        
+        pred_all <- bind_rows(pred_all, df_agg)
+        rm(fit, df, df_agg)
+        gc()
+      }
+    }
+  }
+}
+
+# Average predictions across GCMs and population/flow scenarios for each SSP
+pred_scenario <- pred_all %>%
+  group_by(cid, city, year, Scenario) %>%
+  summarise(Pred_mean = mean(Pred_sum, na.rm = TRUE),
+            Pred_sd   = sd(Pred_sum, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(Pred_mean = round(Pred_mean))
+
+# Save each SSP separately (optional)
+for (ssp in unique(pred_scenario$Scenario)) {
+  df_ssp <- pred_scenario %>% filter(Scenario == ssp)
+  write.csv(df_ssp, file.path(rdata.dir, sprintf("%s汇总.csv", ssp), row.names = FALSE))
+}
+
+# Historical observed data (2005–2022) for reference
+obs_city_year <- hist_data %>%
+  group_by(市代码, 年) %>%
+  summarise(Pred_mean = sum(病例数, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Scenario = "Observed", Pred_sd = 0, city = NA) %>%
+  rename(cid = 市代码) %>%
+  select(cid, city, year, Scenario, Pred_mean, Pred_sd)
+
+# Combine observed and future
+data_whole <- bind_rows(obs_city_year, pred_scenario)
+data_whole$Date <- as.Date(paste(data_whole$year, "1", "1", sep = "/"))
+data_whole <- data_whole[order(data_whole$Scenario, data_whole$cid, data_whole$year), ]
+
+# ----------------------------- City-Level Trend Analysis ---------------------
+
+city_ids <- unique(data_whole$cid)
+df_city <- data.frame(
+  CityID = city_ids,
+  SumCase_obs = NA_real_,
+  YearlyCase_obs = NA_real_,
+  mean_future = NA_real_,
+  mean_126 = NA_real_, mean_245 = NA_real_, mean_370 = NA_real_, mean_585 = NA_real_,
+  slope = NA_real_, slope_126 = NA_real_, slope_245 = NA_real_, slope_370 = NA_real_, slope_585 = NA_real_,
+  p = NA_real_, p_126 = NA_real_, p_245 = NA_real_, p_370 = NA_real_, p_585 = NA_real_,
+  level = NA_integer_, level_126 = NA_integer_, level_245 = NA_integer_, level_370 = NA_integer_, level_585 = NA_integer_,
+  percDiff = NA_real_, percDiff_126 = NA_real_, percDiff_245 = NA_real_, percDiff_370 = NA_real_, percDiff_585 = NA_real_
+)
+
+for (i in seq_along(city_ids)) {
+  cid <- city_ids[i]
+  
+  # Observed cases (2005–2022)
+  obs_ts <- data_whole %>% filter(cid == cid, Scenario == "Observed", year <= 2022) %>% pull(Pred_mean)
+  sum_obs <- sum(obs_ts)
+  mean_obs <- mean(obs_ts)
+  
+  # Future predictions per SSP (years > 2022)
+  pred_126 <- data_whole %>% filter(cid == cid, Scenario == "SSP126", year > 2022) %>% pull(Pred_mean)
+  pred_245 <- data_whole %>% filter(cid == cid, Scenario == "SSP245", year > 2022) %>% pull(Pred_mean)
+  pred_370 <- data_whole %>% filter(cid == cid, Scenario == "SSP370", year > 2022) %>% pull(Pred_mean)
+  pred_585 <- data_whole %>% filter(cid == cid, Scenario == "SSP585", year > 2022) %>% pull(Pred_mean)
+  
+  # Average across SSPs (if all available)
+  pred_all_ssp <- c(pred_126, pred_245, pred_370, pred_585)
+  mean_future <- if (length(pred_all_ssp) > 0) mean(pred_all_ssp) else NA
+  
+  # Compute Sen's slope for each SSP and combined
+  calc_sens <- function(x) {
+    if (length(x) < 2) return(list(estimates = NA, p.value = NA))
+    ts_x <- ts(x, start = 2023, frequency = 1)
+    sens <- sens.slope(ts_x)
+    return(list(estimates = sens$estimates, p.value = sens$p.value))
+  }
+  
+  sens_all <- calc_sens(pred_all_ssp)
+  sens_126 <- calc_sens(pred_126)
+  sens_245 <- calc_sens(pred_245)
+  sens_370 <- calc_sens(pred_370)
+  sens_585 <- calc_sens(pred_585)
+  
+  df_city[i, "CityID"] <- cid
+  df_city[i, "SumCase_obs"] <- sum_obs
+  df_city[i, "YearlyCase_obs"] <- mean_obs
+  df_city[i, "mean_future"] <- mean_future
+  df_city[i, "mean_126"] <- mean(pred_126)
+  df_city[i, "mean_245"] <- mean(pred_245)
+  df_city[i, "mean_370"] <- mean(pred_370)
+  df_city[i, "mean_585"] <- mean(pred_585)
+  
+  df_city[i, "slope"] <- sens_all$estimates
+  df_city[i, "slope_126"] <- sens_126$estimates
+  df_city[i, "slope_245"] <- sens_245$estimates
+  df_city[i, "slope_370"] <- sens_370$estimates
+  df_city[i, "slope_585"] <- sens_585$estimates
+  
+  df_city[i, "p"] <- sens_all$p.value
+  df_city[i, "p_126"] <- sens_126$p.value
+  df_city[i, "p_245"] <- sens_245$p.value
+  df_city[i, "p_370"] <- sens_370$p.value
+  df_city[i, "p_585"] <- sens_585$p.value
+  
+  df_city[i, "level"] <- sens.recode(df_city$slope[i], df_city$p[i])
+  df_city[i, "level_126"] <- sens.recode(df_city$slope_126[i], df_city$p_126[i])
+  df_city[i, "level_245"] <- sens.recode(df_city$slope_245[i], df_city$p_245[i])
+  df_city[i, "level_370"] <- sens.recode(df_city$slope_370[i], df_city$p_370[i])
+  df_city[i, "level_585"] <- sens.recode(df_city$slope_585[i], df_city$p_585[i])
+  
+  df_city[i, "percDiff"] <- percent.diff(mean_obs, mean_future)
+  df_city[i, "percDiff_126"] <- percent.diff(mean_obs, mean(pred_126))
+  df_city[i, "percDiff_245"] <- percent.diff(mean_obs, mean(pred_245))
+  df_city[i, "percDiff_370"] <- percent.diff(mean_obs, mean(pred_370))
+  df_city[i, "percDiff_585"] <- percent.diff(mean_obs, mean(pred_585))
+}
+
+write.csv(df_city, file.path(rdata.dir, "/pred_sig_city_yearly.csv", row.names = FALSE))
+
+# ----------------------------------------------------------------------------
+# End of script
+# ----------------------------------------------------------------------------
