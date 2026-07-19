@@ -1,0 +1,98 @@
+# ============================================================================
+# GAM-based selection of zonal covariates for vector-borne disease modeling
+# Demonstration version: only two diseases (Dengue and HFRS) are shown.
+# The same procedure applies to other diseases (details omitted for brevity).
+# ============================================================================
+
+# ----------------------------- Environment Setup -----------------------------
+library(mgcv)
+library(dplyr)
+library(tidyr)
+
+# User-defined paths (modify as needed)
+data_dir   <- "path/to/your/data"
+output_dir <- "path/to/your/output"
+
+# ----------------------------- Helper Functions -----------------------------
+
+#' Extract model diagnostics from a list of GAM models
+get_model_diag <- function(model_list) {
+  n <- length(model_list)
+  res <- data.frame(
+    Model = names(model_list),
+    Formula = sapply(model_list, function(m) {
+      if (inherits(m, "gam")) paste(m$formula[2], "~", m$formula[3]) else NA
+    }),
+    UBRE = sapply(model_list, function(m) if (inherits(m, "gam")) m$gcv.ubre else NA),
+    AIC = sapply(model_list, function(m) if (inherits(m, "gam")) m$aic else NA),
+    Adj.R2 = sapply(model_list, function(m) {
+      if (inherits(m, "gam")) summary(m)$r.sq else NA
+    }),
+    DevExpl = sapply(model_list, function(m) {
+      if (inherits(m, "gam")) summary(m)$dev.expl else NA
+    })
+  )
+  return(res)
+}
+
+#' Write model diagnostics to CSV
+write_model_diag <- function(model_list, file) {
+  diag <- get_model_diag(model_list)
+  write.csv(diag, file, row.names = FALSE)
+}
+
+#' Run GAM selection for a given disease dataset and list of zone variables
+run_gam_selection <- function(data, zone_vars, knot = 5, family = ziP) {
+  # Basic model (climate only)
+  basic_formula <- as.formula(sprintf("病例数 ~ s(月平均气温, k=%d) + s(月平均降水量, k=%d)", knot, knot))
+  model_list <- list()
+  model_list[["basic"]] <- gam(basic_formula, family = family, data = data)
+  
+  # Loop over each zone variable
+  for (zv in zone_vars) {
+    data[[zv]] <- as.factor(data[[zv]])   # ensure factor
+    formula_str <- sprintf(
+      "病例数 ~ s(月平均气温, by = factor(%s), k = %d) +
+                 s(月平均降水量, by = factor(%s), k = %d) +
+                 factor(%s)",
+      zv, knot, zv, knot, zv
+    )
+    f <- as.formula(formula_str)
+    m <- tryCatch(
+      gam(f, family = family, data = data),
+      error = function(e) NA
+    )
+    model_list[[zv]] <- m
+  }
+  return(model_list)
+}
+
+# ----------------------------- Application: Dengue --------------------------
+dengue_data <- read.csv(file.path(data_dir, "登革热/05-24_city_year_month_order.csv"))
+dengue_zone <- c(
+  "climate_zone", "Ecological_zone", "Geomorphic_type", "Three_step_terrain",
+  "Economic_development_zones", "碳排放", "城镇化率", "GDP",
+  "医疗卫生机构床位数", "甲乙类法定报告传染病发病率", "HAQ",
+  "登革热血清型", "不透水面占比.05.23.", "伊蚊密度"
+)
+
+dengue_models <- run_gam_selection(dengue_data, dengue_zone, knot = 5)
+write_model_diag(dengue_models, file.path(output_dir, "dengue_model_diagnostics.csv"))
+
+# ----------------------------- Application: HFRS ----------------------------
+hfrs_data <- read.csv(file.path(data_dir, "HFRS/05-24_city_year_month_order.csv"))
+hfrs_zone <- c(
+  "climate_zone", "Ecological_zone", "Geomorphic_type", "Three_step_terrain",
+  "Economic_development_zones", "碳排放", "城镇化率", "GDP",
+  "医疗卫生机构床位数", "甲乙类法定报告传染病发病率", "HAQ",
+  "野鼠捕获率24", "不透水面占比.05.23."
+)
+
+hfrs_models <- run_gam_selection(hfrs_data, hfrs_zone, knot = 5)
+write_model_diag(hfrs_models, file.path(output_dir, "hfrs_model_diagnostics.csv"))
+
+# ----------------------------------------------------------------------------
+# The same analysis can be applied to other diseases (e.g., Tsutsugamushi,
+# Tick-borne encephalitis, Leptospirosis, SFTS, Kala-azar) by repeating the
+# above steps with their respective zone variable lists.
+# ----------------------------------------------------------------------------
