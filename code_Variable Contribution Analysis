@@ -1,0 +1,118 @@
+# ============================================================================
+# Variable Contribution Analysis for INLA Models (HFRS)
+# This script processes multiple INLA model outputs (fixed + random effects),
+# computes relative contributions, and visualizes grouped contributions.
+# ============================================================================
+
+# ----------------------------- Environment Setup -----------------------------
+library(INLA)
+library(dplyr)
+library(ggplot2)
+library(brinla)   # for bri.hyperpar.summary()
+
+inla.setOption(inla.mode = "experimental")
+
+# ----------------------------- Paths and Scenarios ---------------------------
+work.dir <- "H:/8种媒介疾病处理数据/01 data/HFRS/未来结果"
+setwd(work.dir)
+
+model.dir <- work.dir
+model.files <- list.files(model.dir, pattern = "^obj\\.inla_.*\\.RData$", full.names = TRUE)
+
+scenario.list <- c("SSP126", "SSP245", "SSP370", "SSP585")
+pattern.list  <- c("IPSL-CM6A-LR", "NorESM2-MM", "MPI-ESM1-2-HR", "MRI-ESM2-0", "CMCC-ESM2")
+popS.list     <- c("SSP1", "SSP2", "SSP3")
+flowS.list    <- c("SSP1", "SSP2", "SSP3")
+
+# ----------------------------- Initialize Dataframes -------------------------
+result.inla.all     <- data.frame()   # fixed effects
+result.inla.bri.all <- data.frame()   # random effects (hyperparameters)
+
+# ----------------------------- Loop Over All Model Files ---------------------
+for (s in scenario.list) {
+  for (p in pattern.list) {
+    for (pop in popS.list) {
+      for (flow in flowS.list) {
+        
+        file.name <- sprintf("obj.inla_%s_%s_flux%s_pop%s.RData", s, p, flow, pop)
+        file.path <- file.path(model.dir, file.name)
+        
+        if (!file.exists(file.path)) {
+          cat("File not found, skipping:", file.name, "\n")
+          next
+        }
+        
+        cat("Processing:", file.name, "\n")
+        load(file.path)
+        
+        if (!exists("fit")) {
+          warning("No 'fit' object in:", file.name)
+          next
+        }
+        
+        # ---------- Extract fixed effects ----------
+        result.inla <- as.data.frame(summary(fit)$fixed)
+        result.inla$model <- sprintf("%s_%s_flux%s_pop%s", s, p, flow, pop)
+        result.inla$Variable <- rownames(result.inla)
+        
+        # ---------- Extract random effects (hyperparameters) ----------
+        result.bri <- tryCatch(
+          {
+            tmp <- as.data.frame(bri.hyperpar.summary(fit))
+            tmp$Variable <- rownames(tmp)
+            tmp
+          },
+          error = function(e) {
+            cat("No valid random effects (possibly all NA):", file.name, "\n")
+            NULL
+          }
+        )
+        
+        if (!is.null(result.bri)) {
+          result.bri$model <- result.inla$model[1]
+          # Remove zero-inflation parameters (if any)
+          result.bri <- result.bri[
+            !grepl("zero-inflated|zero-probability", result.bri$Variable),
+          ]
+        }
+        
+        if (nrow(result.inla) == 0 &&
+            (is.null(result.bri) || nrow(result.bri) == 0)) {
+          cat("No parameters available, skipping:", file.name, "\n")
+          rm(fit)
+          next
+        }
+        
+        # ---------- Compute contribution (absolute mean / total sum) ----------
+        total_sum <- sum(
+          abs(result.inla$mean),
+          if (!is.null(result.bri)) abs(result.bri$mean) else 0,
+          na.rm = TRUE
+        )
+        
+        if (nrow(result.inla) > 0) {
+          result.inla$contribute <- abs(result.inla$mean) / total_sum
+        }
+        
+        if (!is.null(result.bri) && nrow(result.bri) > 0) {
+          result.bri$contribute <- abs(result.bri$mean) / total_sum
+        }
+        
+        # ---------- Accumulate ----------
+        if (nrow(result.inla) > 0) {
+          result.inla.all <- rbind(result.inla.all, result.inla)
+        }
+        
+        if (!is.null(result.bri) && nrow(result.bri) > 0) {
+          result.inla.bri.all <- rbind(result.inla.bri.all, result.bri)
+        }
+        
+        rm(fit)
+      }
+    }
+  }
+}
+
+# ----------------------------- Save Results ---------------------------------
+write.csv(result.inla.all, "INLA_Fixed_Effect_nozero.csv", row.names = FALSE)
+write.csv(result.inla.bri.all, "INLA_Random_Effect_nozero.csv", row.names = FALSE)
