@@ -177,8 +177,185 @@ ggsave(file.path(output_dir, "HFRS_national_fit.pdf"), p_national,
        width = 10, height = 6, dpi = 300)
 
 # ----------------------------------------------------------------------------
-# For province-level plots, one can use the same 'data.valid' and facet by
-# province. The code is omitted here for brevity but can be easily added.
 # The same modeling framework can be applied to other diseases by replacing
 # the input data and adjusting the formula if necessary.
+# ----------------------------------------------------------------------------
+
+
+# --- Future Prediction ---
+# Future projection using fitted INLA model (HFRS example)
+# the framework can be extended to multiple GCMs and SSPs.
+# ----------------------------- Environment Setup -----------------------------
+library(INLA)
+library(dplyr)
+library(parallel)
+
+# User-defined paths (modify as needed)
+data_dir   <- "path/to/your/data"
+output_dir <- "path/to/your/output"
+
+set.seed(1234)
+inla.setOption(inla.mode = "experimental")
+
+# ----------------------------- Helper Functions -----------------------------
+
+# Group continuous variable into quantile bins (for RW1 effects)
+inla.group.wrap <- function(data, breaks) {
+  require(dplyr)
+  colnames(data)[2] <- "value"
+  data$group <- findInterval(data$value, breaks, rightmost.closed = TRUE)
+  data.median <- data %>%
+    group_by(group) %>%
+    summarise(var.grp = median(value, na.rm = TRUE))
+  data <- merge(data, data.median, by = "group")
+  data <- data[order(data$ID), ]
+  return(data$var.grp)
+}
+
+# ----------------------------- Load Data & Model ----------------------------
+
+# Load spatial adjacency
+W.City <- inla.read.graph(filename = file.path(data_dir, "空间结构矩阵/W.City.adj"))
+
+# Historical data (2005–2024)
+data.hist <- read.csv(file.path(data_dir, "HFRS/05-24_city_year_month_order.csv"))
+# Rename columns for convenience
+data.hist <- data.hist %>%
+  rename(year = 年, month = 月, total_count = 病例数, pop = 人口,
+         cid = 市代码, city = 市名) %>%
+  arrange(cid, year, month)
+city.levels <- sort(unique(data.hist$cid))
+data.hist$CityID <- match(data.hist$cid, city.levels)
+data.hist$医疗卫生机构床位数 <- factor(data.hist$医疗卫生机构床位数)
+data.hist$甲乙类法定报告传染病发病率 <- factor(data.hist$甲乙类法定报告传染病发病率)
+data.hist$climate_zone <- factor(data.hist$climate_zone)
+data.hist$Geomorphic_type <- factor(data.hist$Geomorphic_type)
+
+# Load MAVE results (pre-computed)
+load(file.path(data_dir, "HFRS/obj.mave.2005-2024.all.MAVE_new.RData"))
+# This loads: data.x.mave.all, dr.mave.dim.all, mave.info
+
+# Combine historical data with MAVE directions
+data.valid <- cbind(data.hist, data.x.mave.all)
+data.valid$ID <- seq_len(nrow(data.valid))
+data.valid$logPop <- log(data.valid$pop)
+
+# Define climate variable names (same as used in MAVE)
+var.mave.all <- c("月平均气温", "TXx", "TXn", "TNx", "TNn", "TN10P", "TX10P",
+                  "TN90P", "TX90P", "DTR", "FD", "SU", "ID", "TR", "WSDI",
+                  "CSDI", "HWDI", "CWDI", "月平均降水量", "Rx1day", "Rx5day",
+                  "R10mm", "R20mm", "CDD", "CWD", "SDII", "R95p", "R99p", "PRCPTOT")
+
+# Create grouped variables for MAVE directions (for RW1)
+n.quantile <- 20
+for (i in 1:ncol(data.x.mave.all)) {
+  data.valid[[sprintf("dir%d.grp", i)]] <- inla.group.wrap(
+    data.valid[, c("ID", sprintf("dir%d", i))],
+    quantile(data.valid[, sprintf("dir%d", i)], probs = seq(0, 1, 1/n.quantile))
+  )
+}
+
+# ----------------------------- Model Formula --------------------------------
+# This is the same formula as used in the calibration step
+formula <- total_count ~ -1 + log(pop) + log(flux_grav) + log(flux_rad) +
+  医疗卫生机构床位数 + 甲乙类法定报告传染病发病率 + climate_zone + Geomorphic_type +
+  f(dir1.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir2.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir3.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir4.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir5.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir6.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir7.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(CityID, model = "bym2", graph = W.City,
+    scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc", param = c(0.5, 2/3))
+    )) +
+  f(month, model = "ar1", constr = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))) +
+  f(year_re, model = "ar1", constr = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.001))))
+
+# ----------------------------- Future Projection (One Scenario) -------------
+# Select one GCM, SSP, population and flow scenario for demonstration
+scenario <- "SSP126"
+pattern  <- "CMCC-ESM2"
+popS     <- "SSP1"
+flowS    <- "SSP1"
+
+# 1) Read future climate data
+future_file <- file.path(data_dir, "HFRS/未来结果",
+                         sprintf("27+2个气候指标_%s_%s_processed.csv", scenario, pattern))
+future.raw <- read.csv(future_file) %>%
+  subset(cid != 460300) %>%   # exclude certain city if needed
+  arrange(cid, year, month) %>%
+  mutate(total_count = NA)
+
+# 2) Apply MAVE transformation to future climate
+future.mave <- as.matrix(rbind(data.hist[, var.mave.all], future.raw[, var.mave.all]))
+for (i in seq_along(var.mave.all)) {
+  v <- var.mave.all[i]
+  future.mave[, i] <- (future.mave[, i] - mave.info[[v]]$var.mean) / mave.info[[v]]$var.sd
+  future.mave[, i] <- future.mave[, i] - mave.info[[v]]$var.min + mave.info$eps[i]
+  lambda <- mave.info[[v]]$lambda
+  future.mave[, i] <- (future.mave[, i]^lambda - 1) / lambda
+}
+future.mave <- mave.data(dr.mave.dim.all, future.mave, dim = 10)  # 10 dimensions
+
+# 3) Prepare future data frame with covariates
+df.future <- future.raw
+df.future$flux_grav <- df.future[[paste0("flux_grav_", flowS)]]
+df.future$flux_rad  <- df.future[[paste0("flux_rad_" , flowS)]]
+# Replace population with corresponding SSP scenario
+df.future$pop <- df.future[[popS]]
+
+# Combine with MAVE components
+data.future <- cbind(df.future[, c("cid", "year", "month", "total_count", "pop",
+                                   "flux_grav", "flux_rad",
+                                   "医疗卫生机构床位数", "甲乙类法定报告传染病发病率",
+                                   "climate_zone", "Geomorphic_type")],
+                     future.mave)
+
+# 4) Create derived variables
+data.future <- data.future %>%
+  mutate(logPop = log(pop),
+         ID = row_number(),
+         CityID = match(cid, city.levels),
+         year_re = year,
+         month1 = month)
+
+# 5) Group MAVE directions for RW1
+for (i in 1:10) {
+  data.future[[sprintf("dir%d.grp", i)]] <- inla.group.wrap(
+    data.future[, c("ID", sprintf("dir%d", i))],
+    quantile(data.future[, sprintf("dir%d", i)], probs = seq(0, 1, 1/n.quantile))
+  )
+}
+
+# 6) Fit INLA model (using the same hyperparameters as in calibration)
+fit <- inla(
+  formula,
+  family = "zeroinflatedpoisson1",
+  data = data.future,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.inla = list(strategy = "adaptive", int.strategy = "eb"),
+  control.compute = list(dic = TRUE, cpo = TRUE, waic = TRUE,
+                         openmp.strategy = "huge"),
+  control.fixed = list(prec = 5, prec.intercept = 0.001),
+  num.threads = max(1, detectCores() - 1),
+  verbose = FALSE
+)
+
+# 7) Save results
+data.future$Pred <- fit$summary.fitted.values$mean
+fit$data <- data.future
+save(fit, file = file.path(output_dir,
+                           sprintf("obj.inla_%s_%s_flux%s_pop%s.RData",
+                                   scenario, pattern, flowS, popS)))
+
+# ----------------------------------------------------------------------------
+# This framework can be extended to other GCMs, SSPs, and population/flow
+# scenarios by looping over the respective lists. The same MAVE transformation
+# and INLA formula are reused.
 # ----------------------------------------------------------------------------
