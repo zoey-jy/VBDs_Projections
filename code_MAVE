@@ -1,0 +1,180 @@
+# ============================================================================
+# MAVE (Minimum Average Variance Estimation) for climate-driver selection
+# Demonstration version: only two diseases (Dengue and HFRS) are shown.
+# The same procedure applies to other diseases (details omitted for brevity).
+# ============================================================================
+
+# ----------------------------- Environment Setup -----------------------------
+library(MAVE)
+library(dplyr)
+library(tidyr)
+library(forecast)
+library(MASS)
+
+# User-defined paths (modify as needed)
+data_dir   <- "path/to/your/data"
+output_dir <- "path/to/your/output"
+
+# ----------------------------- Helper Functions -----------------------------
+
+#' Prepare monthly case data from raw case records
+#' @param case_file Path to raw case file with columns: 发病日期, 市_id
+#' @param city_file Path to city reference file with columns: 市代码, ...
+#' @param start_year, end_year Range of years to include
+#' @return A complete monthly panel dataset (city-year-month) with case counts
+prepare_monthly_data <- function(case_file, city_file, start_year = 2005, end_year = 2024) {
+  # Read raw case data
+  cases <- read.csv(case_file)
+  cases$发病日期 <- as.Date(cases$发病日期)
+  cases <- cases %>%
+    mutate(年 = year(发病日期), 月 = month(发病日期)) %>%
+    group_by(市_id, 年, 月) %>%
+    summarise(病例数 = n(), .groups = "drop") %>%
+    # Harmonize municipality codes (e.g., Beijing 110100 -> 110000)
+    mutate(市_id = case_when(
+      市_id %in% c(110100, 120100, 310100) ~ as.integer(市_id / 100) * 100,
+      市_id == 500200 ~ 500000,
+      TRUE ~ 市_id
+    )) %>%
+    rename(市代码 = 市_id)
+  
+  # City list
+  cities <- read.csv(city_file, fileEncoding = "GBK")
+  all_cities <- unique(cities$市代码)
+  years <- seq(start_year, end_year)
+  months <- 1:12
+  
+  # Full grid of all combinations
+  full_grid <- expand.grid(市代码 = all_cities, 年 = years, 月 = months)
+  
+  # Merge case counts and fill missing with 0
+  full_data <- full_grid %>%
+    left_join(cases, by = c("市代码", "年", "月")) %>%
+    mutate(病例数 = ifelse(is.na(病例数), 0, 病例数)) %>%
+    left_join(cities, by = "市代码")
+  
+  return(full_data)
+}
+
+# ----------------------------- Core MAVE Modeling Function ------------------
+
+run_mave_analysis <- function(data, var.mave.all, 
+                              max_dim = 20, final_dim = 10, seed = 1234) {
+  set.seed(seed)
+  
+  # Extract predictors and response
+  X <- data[, var.mave.all]
+  y <- as.vector(data$病例数)
+  
+  # Compute mean and sd for standardization (based on historical data only)
+  mean_vals <- apply(X, 2, mean)
+  sd_vals   <- apply(X, 2, sd)
+  
+  # We need to incorporate future climate data for standardization (min values)
+  # For demonstration, we read all CMIP6 files from a directory
+  # (In practice, this path should point to the actual future data)
+  future_dir <- file.path(data_dir, "CMIP6 data/CMIP6数据（四个SSP五个GCM）")
+  file_list <- list.files(future_dir, pattern = "*.csv", full.names = TRUE)
+  future_data <- do.call(rbind, lapply(file_list, read.csv))
+  future_data[is.na(future_data)] <- 0
+  future_data <- future_data[future_data[, 2] > 2024, ]  # year column assumed 2nd
+  X_future <- future_data[, var.mave.all]
+  
+  # Combine historical and future for full range
+  X_whole <- rbind(X, X_future)
+  X_whole_std <- (X_whole - matrix(mean_vals, nrow = nrow(X_whole), ncol = ncol(X_whole), byrow = TRUE)) /
+    matrix(sd_vals, nrow = nrow(X_whole), ncol = ncol(X_whole), byrow = TRUE)
+  whole_min <- apply(X_whole_std, 2, min)
+  
+  # Standardize historical X
+  X_std <- (X - matrix(mean_vals, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)) /
+    matrix(sd_vals, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
+  
+  # Box-Cox transformation per variable (with small epsilon to avoid zero)
+  eps <- matrix(runif(n = length(whole_min), min = 0, max = 0.1), nrow = 1)
+  lambda_vec <- numeric(length(var.mave.all))
+  X_trans <- X_std
+  for (i in seq_along(var.mave.all)) {
+    x_i <- X_std[, i]
+    x_shift <- x_i - whole_min[i] + eps[i]
+    bc <- boxcox(x_shift ~ 1, plotit = FALSE)
+    lambda <- bc$x[which.max(bc$y)]
+    lambda_vec[i] <- lambda
+    X_trans[, i] <- (x_shift^lambda - 1) / lambda
+  }
+  
+  # Store transformation parameters for later use (optional)
+  mave_info <- list(
+    mean = mean_vals,
+    sd = sd_vals,
+    min = whole_min,
+    eps = eps,
+    lambda = lambda_vec
+  )
+  
+  # Fit MAVE
+  dr <- mave(y ~ X_trans, max.dim = max_dim)
+  dr_dim <- mave.dim(dr)  # chooses optimal dimension via CV
+  # Extract coefficients at the chosen dimension (final_dim)
+  coef_mat <- coef(dr_dim, dim = final_dim)
+  rownames(coef_mat) <- sub("X_trans", "", rownames(coef_mat))
+  # Also get absolute coefficients for ranking
+  coef_abs <- abs(coef_mat)
+  
+  return(list(
+    dr = dr,
+    dr_dim = dr_dim,
+    coef = coef_mat,
+    coef_abs = coef_abs,
+    mave_info = mave_info,
+    X_trans = X_trans
+  ))
+}
+
+# ----------------------------- Apply to Dengue -----------------------------
+
+# Define the list of climate variables (same for all diseases)
+var.mave.all <- c("月平均气温", "TXx","TXn","TNx", "TNn", "TN10P","TN90P","TX10P", "TX90P", 
+                  "DTR", "FD", "SU", "ID", "TR","WSDI","CSDI", "HWDI", "CWDI",
+                  "月平均降水量", "Rx1day", "Rx5day", "R10mm","R20mm", "CDD", "CWD", 
+                  "SDII", "R95p", "R99p","PRCPTOT")
+
+dengue_panel <- prepare_monthly_data(
+  case_file = file.path(data_dir, "dengue_raw.csv"),   # adjust filename
+  city_file = file.path(data_dir, "cities367.csv")
+)
+# If you already have the processed file, just read it:
+# dengue_panel <- read.csv(file.path(data_dir, "登革热/05-24_city_year_month_order.csv"))
+
+# Run MAVE on Dengue
+dengue_result <- run_mave_analysis(dengue_panel, var.mave.all, max_dim = 20, final_dim = 10)
+
+# Save diagnostics and coefficients
+write.csv(dengue_result$coef_abs, 
+          file.path(output_dir, "dengue_mave_coef_abs.csv"), row.names = TRUE)
+
+# Optionally save the full MAVE objects
+save(dengue_result, file = file.path(output_dir, "dengue_mave_result.RData"))
+
+# ----------------------------- Apply to HFRS -----------------------------
+
+hfrs_panel <- prepare_monthly_data(
+  case_file = file.path(data_dir, "hfrs_raw.csv"),    # adjust filename
+  city_file = file.path(data_dir, "cities367.csv")
+)
+# Or read pre-processed file:
+# hfrs_panel <- read.csv(file.path(data_dir, "HFRS/05-24_city_year_month_order.csv"))
+
+hfrs_result <- run_mave_analysis(hfrs_panel, var.mave.all, max_dim = 20, final_dim = 10)
+
+write.csv(hfrs_result$coef_abs, 
+          file.path(output_dir, "hfrs_mave_coef_abs.csv"), row.names = TRUE)
+
+save(hfrs_result, file = file.path(output_dir, "hfrs_mave_result.RData"))
+
+# ---------------------------------------------------------------------------
+# The same analysis can be replicated for other diseases (Tsutsugamushi,
+# Tick-borne encephalitis, Leptospirosis, SFTS, Kala-azar) by simply
+# providing their respective panel datasets and calling run_mave_analysis().
+# Due to space, we only present the framework here.
+# ---------------------------------------------------------------------------
