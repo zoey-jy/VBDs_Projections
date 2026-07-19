@@ -2,15 +2,14 @@
 ## Software dependencies
 For the development of the code in this repository we primarily made use of the following R packages:
 
+* `mgcv` version 1.9-1
 * `brinla` version 0.1.0
-* `Boruta` version 8.0.0
 * `car` version 3.1-3
 * `carData` version 3.0-5
 * `dplyr` version 1.1.4
 * `INLA` version 24.06.27
 * `lubridate` version 1.9.3
 * `MAVE` version 1.3.11
-* `mgcv` version 1.9-1
 * `mic` version 3.18.0
 * `purrr` version 1.0.2
 * `reshape2` version 1.4.4
