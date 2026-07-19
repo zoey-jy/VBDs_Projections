@@ -1,0 +1,184 @@
+# ============================================================================
+# INLA-based spatio-temporal modeling for HFRS (Hemorrhagic Fever with Renal Syndrome)
+# This script integrates MAVE-derived directions and BYM spatial random effects.
+# Only HFRS is shown; the same framework applies to other diseases.
+# ============================================================================
+
+# ----------------------------- Environment Setup -----------------------------
+library(INLA)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(purrr)   # for walk
+
+# User-defined paths
+data_dir   <- "path/to/your/data"
+output_dir <- "path/to/your/output"
+
+set.seed(1234)
+inla.setOption(inla.mode = "experimental")
+
+# ----------------------------- Data Loading & Preparation --------------------
+
+# Load spatial adjacency matrix (neighborhood structure)
+W.City <- inla.read.graph(filename = file.path(data_dir, "空间结构矩阵/W.City.adj"))
+
+# Load the monthly panel data 
+data.model <- read.csv(file.path(data_dir, "HFRS/05-24_city_year_month_order.csv"))
+
+# Assign a numeric CityID for random effects
+data.model <- data.model %>%
+  mutate(CityID = match(市名, unique(市名)))
+
+data.model$医疗卫生机构床位数 <- factor(data.model$医疗卫生机构床位数)
+data.model$甲乙类法定报告传染病发病率 <- factor(data.model$甲乙类法定报告传染病发病率)
+data.model$climate_zone <- factor(data.model$climate_zone)
+data.model$Geomorphic_type <- factor(data.model$Geomorphic_type)
+
+# Load MAVE results (previously computed)
+load(file.path(data_dir, "HFRS/obj.mave.2005-2024.all.MAVE_new.RData"))
+# This loads 'data.x.mave.all' (the 10 MAVE directions)
+
+# Combine with original data
+data.valid <- cbind(data.model, data.x.mave.all)
+data.valid$ID <- seq_len(nrow(data.valid))
+data.valid$logPop <- log(data.valid$人口)
+
+# ---------- Group continuous variables into quantile bins (for RW1 effects) ----
+n.quantile <- 20
+
+# Helper: assign each value to its group median
+inla.group.wrap <- function(data, breaks) {
+  require(dplyr)
+  colnames(data)[2] <- "value"
+  data$group <- findInterval(data$value, breaks, rightmost.closed = TRUE)
+  data.median <- data %>%
+    group_by(group) %>%
+    summarise(var.grp = median(value, na.rm = TRUE))
+  data <- merge(data, data.median, by = "group")
+  data <- data[order(data$ID), ]
+  return(data$var.grp)
+}
+
+# Group temperature and precipitation
+data.valid$temp.grp <- inla.group.wrap(
+  data.valid[, c("ID", "月平均气温")],
+  quantile(data.valid$月平均气温, probs = seq(0, 1, 1/n.quantile))
+)
+data.valid$pre.grp <- inla.group.wrap(
+  data.valid[, c("ID", "月平均降水量")],
+  quantile(data.valid$月平均降水量, probs = seq(0, 1, 1/n.quantile))
+)
+
+# Group each of the 10 MAVE directions
+for (i in 1:ncol(data.x.mave.all)) {
+  data.valid[[sprintf("dir%d.grp", i)]] <- inla.group.wrap(
+    data.valid[, c("ID", sprintf("dir%d", i))],
+    quantile(data.valid[, sprintf("dir%d", i)], probs = seq(0, 1, 1/n.quantile))
+  )
+}
+
+# Create a time index (2005–2024, monthly)
+time_index <- expand.grid(年 = 2005:2024, 月 = 1:12) %>%
+  arrange(年, 月) %>%
+  mutate(time = seq_along(年))
+data.valid <- data.valid %>%
+  left_join(time_index, by = c("年", "月")) %>%
+  arrange(市代码, 年, 月)
+
+# ---------- Split into calibration (2005–2021) and validation (2022–2024) ----
+data.valid.cv <- data.valid
+data.valid.cv[data.valid.cv$年 > 2021, "病例数"] <- NA   # mask validation cases
+
+# Additional indexing for temporal random effects
+data.valid.cv$year_re <- data.valid.cv$年
+data.valid.cv$year_re[data.valid.cv$年 > 2024] <- 2024
+
+# ---------- Define the model formula -----------------------------------------
+# The formula includes:
+#   - log(population) + two gravity variables (flux_grav, flux_rad) as fixed effects
+#   - factor covariates: 医疗卫生机构床位数, 甲乙类法定报告传染病发病率, climate_zone, Geomorphic_type
+#   - RW1 on each MAVE direction (dir1.grp ... dir10.grp) with scaling
+#   - BYM spatial effect on CityID (using the adjacency graph)
+#   - RW1 on month (seasonality) and RW2 on year (trend)
+
+formula <- 病例数 ~ -1 + log(人口) + log(flux_grav) + log(flux_rad) +
+  医疗卫生机构床位数 + 甲乙类法定报告传染病发病率 + climate_zone + Geomorphic_type +
+  f(dir1.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir2.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir3.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir4.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir5.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir6.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir7.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir8.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir9.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(dir10.grp, model = "rw1", scale.model = TRUE, diagonal = 1e-4) +
+  f(CityID, model = "bym", graph = W.City) +
+  f(月, model = "rw1", constr = TRUE) +
+  f(year_re, model = "rw2", constr = TRUE)
+
+# ----------------------------- Model Fitting --------------------------------
+fit <- inla(
+  formula,
+  family = "zeroinflatedpoisson1",
+  data = data.valid.cv,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.inla = list(strategy = "adaptive", int.strategy = "eb", cmin = 0),
+  control.compute = list(dic = TRUE, cpo = TRUE, waic = TRUE, openmp.strategy = "huge"),
+  control.fixed = list(prec = 5, prec.intercept = 1),
+  num.threads = parallel::detectCores() - 1
+)
+
+# ----------------------------- Extract Diagnostics --------------------------
+cat("DIC =", fit$dic$dic, "\n")
+cat("WAIC =", fit$waic$waic, "\n")
+cat("Mean -log(CPO) =", mean(-log(fit$cpo$cpo), na.rm = TRUE), "\n")
+
+# ----------------------------- Extract Fitted Values --------------
+fitted_vals <- fit$summary.fitted.values
+
+# Calibration period (2005-2021)
+train_idx <- which(data.valid.cv$年 <= 2021)
+data.valid$fitted_train <- NA
+data.valid$fitted_train[train_idx] <- fitted_vals$mean[train_idx]
+data.valid$fitted_train_lower[train_idx] <- fitted_vals$`0.025quant`[train_idx]
+data.valid$fitted_train_upper[train_idx] <- fitted_vals$`0.975quant`[train_idx]
+
+# Validation period (2022-2024)
+valid_idx <- which(data.valid.cv$年 >= 2022)
+data.valid$predict_valid <- NA
+data.valid$predict_valid[valid_idx] <- fitted_vals$mean[valid_idx]
+data.valid$valid_lower[valid_idx] <- fitted_vals$`0.025quant`[valid_idx]
+data.valid$valid_upper[valid_idx] <- fitted_vals$`0.975quant`[valid_idx]
+
+# ----------------------------- Visualization ----------------
+# Aggregate to national monthly totals
+national <- data.valid %>%
+  group_by(年, 月) %>%
+  summarise(
+    observed = sum(病例数, na.rm = TRUE),
+    fitted   = sum(fitted_train, na.rm = TRUE),
+    lower    = sum(fitted_train_lower, na.rm = TRUE),
+    upper    = sum(fitted_train_upper, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(date = as.Date(paste(年, 月, "01", sep = "-")))
+
+p_national <- ggplot(national, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "blue", alpha = 0.2) +
+  geom_line(aes(y = observed), color = "red", size = 1) +
+  geom_line(aes(y = fitted), color = "blue", linetype = "dashed", size = 0.8) +
+  labs(x = "Date", y = "Number of cases",
+       title = "HFRS: National observed vs. fitted (2005-2024)") +
+  theme_minimal()
+
+ggsave(file.path(output_dir, "HFRS_national_fit.pdf"), p_national,
+       width = 10, height = 6, dpi = 300)
+
+# ----------------------------------------------------------------------------
+# For province-level plots, one can use the same 'data.valid' and facet by
+# province. The code is omitted here for brevity but can be easily added.
+# The same modeling framework can be applied to other diseases by replacing
+# the input data and adjusting the formula if necessary.
+# ----------------------------------------------------------------------------
