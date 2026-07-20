@@ -205,7 +205,7 @@ for (i in seq_along(city_ids)) {
   df_city[i, "percDiff_370"] <- percent.diff(mean_obs, mean(pred_370))
   df_city[i, "percDiff_585"] <- percent.diff(mean_obs, mean(pred_585))
 }
-
+ 
 write.csv(df_city, file.path(rdata.dir, "/pred_sig_city_yearly.csv", row.names = FALSE))
 
 # ----------------------------------------------------------------------------
